@@ -5,7 +5,7 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
-from shapely.geometry import MultiPolygon, Polygon, Point
+from shapely.geometry import LineString, MultiPolygon, Polygon, Point
 from shapely.geometry.polygon import orient
 from shapely.ops import triangulate
 
@@ -89,6 +89,33 @@ def extract_single_trip(df_orig: pd.DataFrame, target_trip: str) -> MultiPolygon
     return gsb.unary_union
 
 
+def route_simplify(tdf):
+    keep_pts = [tdf.geometry.values[0]]
+    for v in tdf.geometry.values:
+        if not keep_pts[-1] == v:
+            keep_pts.append(v)
+            
+    if len(keep_pts) < 4:
+        return None
+    else:
+        ls = LineString(keep_pts)
+        return ls.simplify(0.005).buffer(0.005)
+
+    
+def ensure_sufficient_overlap(reference_trip, series):
+    rtrip_bufff = reference_trip.buffer(ACCURACY)
+    geoms = list(series)
+    g_index = list(series.index)
+    
+    ok_list = []
+    for ix, g in zip(g_index, geoms):
+        i_area = g.intersection(rtrip_bufff).area
+        proportion_satisfied = i_area/g.area > 0.125
+        ok_list.append(proportion_satisfied)
+            
+    return series[np.array(ok_list)]
+
+
 def get_similar_routes(reference_trip: MultiPolygon,
                        df_orig: pd.DataFrame) -> pd.Series:
     # Always control against mutation out of scope with Pandas dataframes
@@ -97,20 +124,32 @@ def get_similar_routes(reference_trip: MultiPolygon,
     # Make a GeoDataFrame of the entire point cloud
     df_xys = [Point(x, y) for x, y in zip(df['lon'].values, df['lat'].values)]
     df_gdf = gpd.GeoDataFrame(df, geometry=df_xys)
+    
+    new_geoms = df_gdf.groupby('trip_id').apply(route_simplify)
 
-    print('Starting total GDF length: ', len(df_gdf))
-    df_gdf.geometry = df_gdf.buffer(ACCURACY)
+    clean_lines_ids = []
+    clean_lines = []
+    for ls_id, ls in zip(new_geoms.index, new_geoms.values):
+        if ls is not None:
+            clean_lines_ids.append(ls_id)
+            clean_lines.append(ls)
+            
+    df_gdf = gpd.GeoDataFrame({'trip_id': clean_lines_ids}, geometry=clean_lines)
+
     df_int_gdf = df_gdf[df_gdf.intersects(reference_trip)]
-    print('Subset that intersect target trip: ', len(df_int_gdf))
 
     # Get the IDs of those that intersect by Trip ID
     unique_trip_ids = list(set(df_int_gdf['trip_id'].values))
-    print('These trips intersect: {}'.format(len(unique_trip_ids)))
+    print('Subset that intersect target trip: ', len(unique_trip_ids))
 
+    # Only keep trips that overlap at least 1/3 with reference trip
     grouped_trips = (df_int_gdf.groupby('trip_id')
                         .apply(lambda g: g.geometry.unary_union))
-    
-    return grouped_trips
+
+    valid_subset = ensure_sufficient_overlap(reference_trip, grouped_trips)
+    print('Of that subset: {} are valid'.format(len(valid_subset)))
+
+    return valid_subset
 
 
 def unify_trips(grouped_trips: pd.Series) -> MultiPolygon:
@@ -121,7 +160,7 @@ def unify_trips(grouped_trips: pd.Series) -> MultiPolygon:
         unioned = MultiPolygon([unioned])
     
     polys = [p for p in unioned]
-    print('Unified polygons: '.format(len(polys)))
+    print('Unified polygons: {}'.format(len(polys)))
 
     # Drop the polygons in single MultoPolygon object
     return MultiPolygon(polys).simplify(0.0001)
@@ -150,14 +189,11 @@ def triangulate_path_shape(path_shape: Union[Polygon, MultiPolygon]) -> List[Pol
     for p in path_shape:
         triangles = MultiPolygon(triangulate(p, tolerance=0.0))
         t_list = t_list + [t for t in triangles]
-        
-    # Cast triangle array as a GeoSeries
-    tl_gs = gpd.GeoSeries(t_list)
 
     # Toss 
     tri_cleaned = []
-    for poly in triangles:
-        if poly.centroid.intersects(path_shape):
+    for poly in t_list:
+        if poly.centroid.buffer(0.0001).intersects(path_shape):
             tri_cleaned.append(poly)
 
     return tri_cleaned
@@ -274,8 +310,11 @@ def get_farthest_point_pair(skeleton) -> Tuple[Point]:
             sink_converted = Point(sink[0], sink[1])
             end_pt_id = named_points.get_nearest_node_id(sink_converted)
             
+            # Make sure to add pathways in both directions
+            # to ensure possibility of bi-directional flow
             edge_dist = source_converted.distance(sink_converted)
             sg.add_edge(start_pt_id, end_pt_id, weight=edge_dist)
+            sg.add_edge(end_pt_id, start_pt_id, weight=edge_dist)
 
     p = nx.shortest_path(sg)
 
@@ -340,7 +379,9 @@ def generate_multidigraph(tri_cleaned: List,
     node_count = 0
 
     id_of_end_pt = None
+    curr_lowest_dist_end = 100000000
     id_of_start_pt = None
+    curr_lowest_dist_start = 100000000
 
     for tri in tri_cleaned:
         coords = list(tri.exterior.coords)
@@ -349,11 +390,15 @@ def generate_multidigraph(tri_cleaned: List,
         
         for one_id, coord in zip(ids, coords[0:3]):
             
-            thresh = 0.0001
-            if end_pt.distance(Point(*coord)) < thresh:
+            end_pt_dist = end_pt.distance(Point(*coord))
+            if end_pt_dist < curr_lowest_dist_end:
                 id_of_end_pt = one_id
-            if start_pt.distance(Point(*coord)) < thresh:
+                curr_lowest_dist_end = end_pt_dist
+
+            start_pt_dist = start_pt.distance(Point(*coord))
+            if start_pt_dist < curr_lowest_dist_start:
                 id_of_start_pt = one_id
+                curr_lowest_dist_start = start_pt_dist
             
             G.add_node(one_id, x=coord[0], y=coord[1])
 
@@ -366,6 +411,8 @@ def generate_multidigraph(tri_cleaned: List,
             if b_id > ids[-1]:
                 b_id = ids[0]
 
+            # Make sure to add pathways in both directions
+            # to ensure possibility of bi-directional flow
             G.add_edge(a_id, b_id, length = d)
             G.add_edge(b_id, a_id, length = d)
 
