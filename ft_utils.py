@@ -152,18 +152,29 @@ def get_similar_routes(reference_trip: MultiPolygon,
     return valid_subset
 
 
-def unify_trips(grouped_trips: pd.Series) -> MultiPolygon:
-    unioned = gpd.GeoSeries(grouped_trips).unary_union
+def unify_trips(grouped_trips: pd.Series, buffer: float=ACCURACY) -> Polygon:
+    # Receives a list of points and needs to buffer them enough to create
+    # a unary union successfully.
+    unioned = gpd.GeoSeries(grouped_trips).buffer(buffer).unary_union
 
     # If it is just a Poly, make it a MultiPoly
     if not isinstance(unioned, MultiPolygon):
         unioned = MultiPolygon([unioned])
     
+    # TODO: This breakdown into a list is unnecessary.
+    #       Update logging.
     polys = [p for p in unioned]
-    print('Unified polygons: {}'.format(len(polys)))
+    print('Unified polygons: {}. Largest will be extracted.'.format(len(polys)))
 
-    # Drop the polygons in single MultoPolygon object
-    return MultiPolygon(polys).simplify(0.0001)
+    # First get the first component
+    largest = polys[0]
+    # Then update if another one is bigger than it
+    for p in polys:
+        if largest.area < p.area:
+            largest = p
+
+    # Return only the largest of the simplified geometries
+    return largest.simplify(0.0001)
 
 
 def get_next_target_trip(df: pd.DataFrame, use_vals: List[str]) -> str:
@@ -182,13 +193,23 @@ def triangulate_path_shape(path_shape: Union[Polygon, MultiPolygon]) -> List[Pol
     # Convert a Polygon into a MultiPoly if it is submitted as the path_shape
     if not isinstance(path_shape, MultiPolygon):
         path_shape = MultiPolygon([path_shape])
+    
+    # TODO: Brittle component.
+    #       Need to better infer the largest shape and deal with outliers.
+    # We need to only use the largest of the polygons
+    
+    # First get the first component
+    largest = [p for p in path_shape][0]
+    # Then update if another one is bigger than it
+    for p in path_shape:
+        if largest.area < p.area:
+            largest = p
+
 
     # Flatten triangulations of each polygon in shape into a
     # one-level array of triangles
-    t_list = []
-    for p in path_shape:
-        triangles = MultiPolygon(triangulate(p, tolerance=0.0))
-        t_list = t_list + [t for t in triangles]
+    triangles = MultiPolygon(triangulate(largest, tolerance=0.0))
+    t_list = [t for t in triangles]
 
     # Toss 
     tri_cleaned = []
@@ -306,6 +327,8 @@ def get_farthest_point_pair(skeleton) -> Tuple[Point]:
         start_pt_id = named_points.get_nearest_node_id(source_converted)
         
         # Iterate through the end values
+        all_dists = []
+        edges_to_add = []
         for sink in edge.sinks:
             sink_converted = Point(sink[0], sink[1])
             end_pt_id = named_points.get_nearest_node_id(sink_converted)
@@ -313,8 +336,27 @@ def get_farthest_point_pair(skeleton) -> Tuple[Point]:
             # Make sure to add pathways in both directions
             # to ensure possibility of bi-directional flow
             edge_dist = source_converted.distance(sink_converted)
-            sg.add_edge(start_pt_id, end_pt_id, weight=edge_dist)
-            sg.add_edge(end_pt_id, start_pt_id, weight=edge_dist)
+
+            all_dists.append(edge_dist)
+            edges_to_add.append({'a': start_pt_id,
+                                 'b': end_pt_id,
+                                 'd': edge_dist})
+
+        # Figure out what the mean distance is
+        dist_mean = np.array(all_dists).mean()
+        for possible_edge in edges_to_add:
+            a = possible_edge['a']
+            b = possible_edge['b']
+            d = possible_edge['d']
+
+            # TODO: Brittle component!
+            #       Need to intelligently parse outliers
+            # Note: Only add the edges if it's within 3x the mean
+            #       (this is generous, as mean already is thrown 
+            #       off by outliers)
+            if d < dist_mean * 3:
+                sg.add_edge(a, b, weight=d)
+                sg.add_edge(b, a, weight=d)
 
     p = nx.shortest_path(sg)
 
@@ -372,6 +414,7 @@ def great_circle_vec(lat1, lng1, lat2, lng2, earth_radius=6371009):
 
 
 def generate_multidigraph(tri_cleaned: List,
+                          reference_shape: Polygon,
                           start_pt: Point,
                           end_pt: Point) -> nx.MultiDiGraph:
     G = nx.MultiDiGraph()
@@ -417,6 +460,26 @@ def generate_multidigraph(tri_cleaned: List,
             G.add_edge(b_id, a_id, length = d)
 
         node_count += 4
+
+    # Do the same for the reference shape, add its nodes to the path
+    ref_coords = reference_shape.exterior.coords
+    for a, b in zip(ref_coords[:-1], ref_coords[1:]):
+        a = Point(*a)
+        b = Point(*b)
+
+        node_count += 1
+        a_id = node_count
+        G.add_node(a_id, x=a.x, y=a.y)
+
+        node_count += 1
+        b_id = node_count
+        G.add_node(b_id, x=b.x, y=b.y)
+
+        # Make sure to add pathways in both directions
+        # to ensure possibility of bi-directional flow
+        d = great_circle_vec(a.y, a.x, b.y, b.x)
+        G.add_edge(a_id, b_id, length = d)
+        G.add_edge(b_id, a_id, length = d)
 
     # Now we need to add connectors between each of the triangles
     # from within the triangle collection
